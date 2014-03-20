@@ -173,9 +173,9 @@ def tarbell_install_template(command, args):
             ))
             sys.exit()
 
-        puts("\nInstalling {0}".format(colored.cyan(template_url))) 
+        puts("\nInstalling {0}".format(colored.cyan(template_url)))
         tempdir = tempfile.mkdtemp()
-        puts("\n- Cloning repo to {0}".format(colored.green(tempdir))) 
+        puts("\n- Cloning repo to {0}".format(colored.green(tempdir)))
         tempdir = tempfile.mkdtemp()
         git = sh.git.bake(_cwd=tempdir)
         puts(git.clone(template_url, '.'))
@@ -301,6 +301,77 @@ def _delete_dir(dir):
         pass
 
 
+
+
+def tarbell_fastnewproject(command, args):
+    """Fast create new Tarbell project."""
+    with ensure_settings(command,args) as settings:
+
+        # Create directory or bail
+        name = _get_project_name(args)
+        puts("Creating {0}".format(colored.cyan(name)))
+        path = _fast_get_path(name, settings)
+        title = _fast_get_project_title(args)
+        template = _fast_get_template(settings)
+
+        # Init repo
+        git = sh.git.bake(_cwd=path)
+        puts(git.init())
+
+        # Create submodule
+        puts(git.submodule.add(template['url'], '_base'))
+        puts(git.submodule.update(*['--init']))
+
+        # Get submodule branches, switch to current version
+        submodule = sh.git.bake(_cwd=os.path.join(path, '_base'))
+        puts(submodule.fetch())
+        puts(submodule.checkout(VERSION))
+
+        # Create spreadsheet
+        key = _fast_create_spreadsheet(name, title, path, settings, args)
+
+        # Create config file
+        _copy_config_template(name, title, template, path, key, settings)
+
+        # Copy html files
+        puts(colored.green("\nCopying html files..."))
+        files = glob.iglob(os.path.join(path, "_base", "*.html"))
+        for file in files:
+            if os.path.isfile(file):
+                dir, filename = os.path.split(file)
+                if not filename.startswith("_") and not filename.startswith("."):
+                    puts("Copying {0} to {1}".format(filename, path))
+                    shutil.copy2(file, path)
+        ignore = os.path.join(path, "_base", ".gitignore")
+        if os.path.isfile(ignore):
+            shutil.copy2(ignore, path)
+
+        # Commit
+        puts(colored.green("\nInitial commit"))
+        puts(git.add('.'))
+        puts(git.commit(m='Created {0} from {1}'.format(name, template['url'])))
+
+        # Set up remote url
+        """
+        remote_url = raw_input("\nWhat is the URL of your project repository? (e.g. git@github.com:myaccount/myproject.git, leave blank to skip) ")
+        if remote_url:
+            puts("\nCreating new remote 'origin' to track {0}.".format(colored.yellow(remote_url)))
+            git.remote.add(*["origin", remote_url])
+            puts("\n{0}: Don't forget! It's up to you to create this remote and push to it.".format(colored.cyan("Warning")))
+        else:
+            puts("\n- Not setting up remote repository. Use your own version control!")
+        """
+
+        # Messages
+        puts("\nAll done! To preview your new project, type:\n")
+        puts("{0} {1}".format(colored.green("tarbell switch"), colored.green(name)))
+        puts("\nor\n")
+        puts("{0}".format(colored.green("cd %s" % path)))
+        puts("{0}".format(colored.green("tarbell serve\n")))
+
+        puts("\nYou got this!\n")
+
+
 def tarbell_newproject(command, args):
     """Create new Tarbell project."""
     with ensure_settings(command, args) as settings:
@@ -378,6 +449,12 @@ def _get_project_name(args):
         return name
 
 
+def _fast_get_project_title(args):
+        """Get project title"""
+        title = args.get(1)
+        return title
+
+
 def _get_project_title():
         """Get project title"""
         title = None
@@ -386,6 +463,32 @@ def _get_project_title():
             title = raw_input("What is the project's full title? (e.g. My awesome project) ")
 
         return title
+
+
+def _fast_get_path(name, settings, mkdir=True):
+    """Generate a project path."""
+    default_projects_path = settings.config.get("projects_path")
+    path = None
+
+    if default_projects_path:
+        path = os.path.join(default_projects_path, name)
+    else:
+        while not path:
+            path = raw_input("\nWhere would you like to create this project? (e.g. ~/tarbell/) ")
+
+    path = os.path.expanduser(path)
+
+    if mkdir:
+        try:
+            os.mkdir(path)
+        except OSError, e:
+            if e.errno == 17:
+                show_error("ABORTING: Directory {0} already exists.".format(path))
+            else:
+                show_error("ABORTING: OSError {0}".format(e))
+            sys.exit()
+
+    return path
 
 
 def _get_path(name, settings, mkdir=True):
@@ -415,6 +518,9 @@ def _get_path(name, settings, mkdir=True):
 
     return path
 
+def _fast_get_template(settings):
+    return settings.config["project_templates"][0]
+
 
 def _get_template(settings):
     """Prompt user to pick template from a list."""
@@ -443,6 +549,44 @@ def _list_templates(settings):
         ))
 
 
+def _fast_create_spreadsheet(name, title, path, settings, args):
+    """Create Google spreadsheet"""
+    if not settings.client_secrets:
+        return None
+    email =args.get(2)
+
+    if settings.config.get("google_account"):
+        if not email:
+            email = settings.config.get("google_account")
+
+    try:
+        media_body = _MediaFileUpload(os.path.join(path, '_base/_spreadsheet.xlsx'),
+                                      mimetype='application/vnd.ms-excel')
+    except IOError:
+        show_error("_base/_spreadsheet.xlsx doesn't exist!")
+        return None
+
+    service = get_drive_api(settings.path)
+    body = {
+        'title': '{0} (Tarbell)'.format(title),
+        'description': '{0} ({1})'.format(title, name),
+        'mimeType': 'application/vnd.ms-excel',
+    }
+    try:
+        newfile = service.files()\
+            .insert(body=body, media_body=media_body, convert=True).execute()
+        _add_user_to_file(newfile['id'], service, user_email=email)
+        puts("\n{0}! View the spreadsheet at {1}".format(
+            colored.green("Success"),
+            colored.yellow("https://docs.google.com/spreadsheet/ccc?key={0}"
+                           .format(newfile['id']))
+            ))
+        return newfile['id']
+    except errors.HttpError, error:
+        show_error('An error occurred creating spreadsheet: {0}'.format(error))
+        return None
+
+
 def _create_spreadsheet(name, title, path, settings):
     """Create Google spreadsheet"""
     if not settings.client_secrets:
@@ -457,7 +601,7 @@ def _create_spreadsheet(name, title, path, settings):
     email_message = (
         "What Google account should have access to this "
         "this spreadsheet? (Use a full email address, such as "
-        "your.name@gmail.com or the Google account equivalent.) ") 
+        "your.name@gmail.com or the Google account equivalent.) ")
 
     if settings.config.get("google_account"):
         email = raw_input("\n{0}(Default: {1}) ".format(email_message,
@@ -537,7 +681,7 @@ def _copy_config_template(name, title, template, path, key, settings):
             spreadsheet_path = os.path.join(path, '_base/', '_spreadsheet.xlsx')
             with open(spreadsheet_path, "rb") as f:
                 try:
-                    puts("Copying _base/_spreadsheet.xlsx to tarbell_config.py's DEFAULT_CONTEXT") 
+                    puts("Copying _base/_spreadsheet.xlsx to tarbell_config.py's DEFAULT_CONTEXT")
                     data = process_xlsx(f.read())
                     if 'values' in data:
                         data = copy_global_values(data)
@@ -713,6 +857,12 @@ def_cmd(
     fn=tarbell_newproject,
     usage='newproject <project>',
     help='Create a new project named <project>')
+
+def_cmd(
+    name='fastnewproject',
+    fn=tarbell_fastnewproject,
+    usage='fastnewproject <projectname> <projecttitle> <email>',
+    help='Create a new project named <projectname>')
 
 
 def_cmd(
